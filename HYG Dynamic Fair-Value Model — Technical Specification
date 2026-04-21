@@ -1,0 +1,805 @@
+# 
+
+**Author:** Internal — Optiver US Credit
+**Version:** 0.1
+**Scope:** End-to-end specification for a partial-adjustment, regime-switching, fast-to-slow pricing model for HYG using ES1, ZN1, CL1 (hedgeable) and MOVE, VIX (signal-only) as fast factors. The framework generalises to LQD, JNK, IGSB, EMB and other bond ETFs by adjusting the factor set.
+
+---
+
+## 0. Notation and Conventions
+
+| Symbol | Meaning |
+|---|---|
+| $S_t$ | Log mid of HYG at event-time $t$ |
+| $\mathbf{F}_t^H$ | Hedgeable fast-factor vector (log mids) |
+| $\mathbf{F}_t^S$ | Signal-only fast-factor vector |
+| $\boldsymbol{\beta}_t$ | Time-varying loadings on $\mathbf{F}_t^H$ |
+| $\boldsymbol{\gamma}_t$ | Time-varying loadings on $\mathbf{F}_t^S$ |
+| $\boldsymbol{\phi}_{k,t}$ | Distributed-lag coefficients on $\Delta\mathbf{F}_{t-k}$ |
+| $\alpha_t$ | Drifting intercept (NAV-premium proxy) |
+| $V_t$ | Implied fair-value log price |
+| $z_t = S_t - V_t$ | Basis |
+| $M_t, R_t$ | Mean-reverting and random-walk components of $z_t$ |
+| $s_t \in \{N,S\}$ | Latent regime (Normal / Stress) |
+| $\delta_{s_t}$ | Pass-through coefficient |
+| $\kappa_{s_t}$ | Error-correction speed |
+| $\pi_t(j)$ | Filtered regime probability |
+| $\tilde{M}_t$ | Conformal z-score on $M_t$ |
+
+All times are stored in nanosecond UTC epoch. All prices are log-prices unless stated. All bar widths and discount factors are stated relative to a 5-second base unit, with conversion rules given where they apply.
+
+---
+
+## 1. Raw Data Layer
+
+### 1.1 Required feeds
+
+The model requires synchronised tick-by-tick (or millisecond-level) data for the following instruments. Production requires direct exchange feeds; research can use vendor TAQ-equivalents.
+
+| Asset | Venue | Field set |
+|---|---|---|
+| HYG | NYSE Arca | NBBO quotes (bid, ask, bid size, ask size, exchange flag), trades (price, size, condition codes, sale condition flag), and the official Auction Imbalance feed at open and close |
+| ES1 (front E-mini S&P 500) | CME Globex MDP 3.0 | Top-of-book quote (best bid/ask, sizes), trades with aggressor side flag |
+| ZN1 (front 10y Treasury Note) | CME Globex MDP 3.0 | Top-of-book quote, trades with aggressor side flag |
+| CL1 (front WTI crude) | CME Globex MDP 3.0 | Top-of-book quote, trades |
+| MOVE | ICE Data Services intraday MOVE feed | Index level updates (intraday published roughly every 10–60 seconds); fall back to daily close if intraday unavailable for a session |
+| VIX | Cboe Global Indices feed | Index level updates (real-time, ~250ms cadence) |
+| HYG indicative NAV (iNAV) | NYSE Arca iNAV feed | iNAV updates every 15 seconds during regular trading |
+| HYG official NAV | NYSE Arca, end-of-day | Daily striking value at 16:00 ET |
+| HYG holdings file | iShares daily basket file | Constituent-level CUSIP, weight, par |
+| TRACE | FINRA TRACE BTDS | Reported trades on HYG constituents, used as a thinning indicator (not a price input) |
+| Risk-free curve | DTCC SwapClear / Bloomberg | OIS curve at daily granularity |
+
+### 1.2 Storage schema
+
+All feeds normalise to a single Parquet partition layout, partitioned by `(symbol, year, month, day)`, sorted within partition by timestamp. A canonical row schema:
+
+| Column | Type | Notes |
+|---|---|---|
+| `ts_ns` | int64 | UTC nanoseconds since epoch |
+| `symbol` | string | Canonical instrument ID |
+| `event_type` | enum | `quote`, `trade`, `auction`, `index_update`, `corporate_action` |
+| `bid` | float64 | NaN if not a quote event |
+| `ask` | float64 | NaN if not a quote event |
+| `bid_sz` | int64 | NaN if not a quote event |
+| `ask_sz` | int64 | NaN if not a quote event |
+| `last` | float64 | Trade price; NaN otherwise |
+| `last_sz` | int64 | Trade size |
+| `cond_codes` | string[] | TAQ / venue condition codes |
+| `seq_no` | int64 | Venue sequence number for replay verification |
+| `feed_ts_ns` | int64 | Vendor receipt timestamp (for clock-skew detection) |
+
+The `ts_ns` field is the **exchange timestamp**, not the vendor receipt timestamp. The two-timestamp design lets you reconstruct latency distributions and audit clock skew, both essential for HF correctness.
+
+### 1.3 Clock alignment
+
+All timestamps are stored in UTC. Display and trading-rule cutoffs (e.g., session boundaries) are evaluated in America/New_York with explicit DST handling. NYSE Arca regular session is 09:30–16:00 ET; CME futures trade nearly 24 hours but the model evaluates only during the NYSE regular session for HYG, with a "factor warm-up" window from 04:00 ET to 09:30 ET that updates fast-factor states without trading.
+
+### 1.4 History requirements
+
+- 4 weeks rolling tick history for the daily refit (Section 6).
+- 12 months of session-level summary statistics for stress-conditioner calibration (Section 7.5).
+- Approximately 100GB raw data per month for the full instrument set when stored as compressed Parquet with Zstd level 9.
+
+---
+
+## 2. Data Cleaning
+
+### 2.1 Quote cleaning
+
+Apply the following filters in order on every quote event:
+
+1. **Reject if** `bid <= 0` or `ask <= 0` or `bid_sz <= 0` or `ask_sz <= 0`.
+2. **Reject if** `ask <= bid` (crossed or locked book; NBBO should never cross).
+3. **Reject if** `(ask - bid) / mid > spread_max(symbol)` where `spread_max` is set to 50× the trailing 30-day median spread for HYG (typically 1bp, so cutoff at 50bp), 5× for futures, 10× for indices.
+4. **Reject if** the quote is identical to the previous accepted quote (deduplication on the four-tuple).
+5. **Reject** any quote condition code in the venue's "manual" or "non-firm" set.
+
+After filtering, recompute `mid = (bid + ask) / 2` and `log_mid = log(mid)`.
+
+### 2.2 Trade cleaning
+
+Trades are used for diagnostics and effective-spread estimation, not as the price input to the model (mids are used). Filter:
+
+1. Drop trades with TAQ condition codes outside the regular-trade set (`@`, blank, or venue equivalent).
+2. Drop trades occurring outside the regular session (no extended-hours trades for HYG).
+3. Drop "out-of-sequence" or "corrected" prints (TAQ correction codes 1, 2; sale conditions O, T, U, Z).
+
+### 2.3 Outlier filtering
+
+After quote cleaning, apply a robust outlier filter on the resulting log-mid series, separately per symbol:
+
+- Compute 1-second mid-to-mid log returns $r_t$ on a rolling 300-second window.
+- Compute the median $\tilde{r}$ and the median absolute deviation $\text{MAD}_t = 1.4826 \cdot \text{median}(|r_t - \tilde{r}|)$.
+- Flag any tick where $|r_t - \tilde{r}| > 6 \cdot \text{MAD}_t$ as an outlier.
+- For an outlier tick, do not delete the quote; instead, mark it with `outlier_flag = True` and exclude from RV / TSRV computations but include in the Kalman filter with an inflated measurement variance ($10\sigma_\nu^2$).
+
+This avoids the brittleness of hard deletion while preventing single fat-finger ticks from corrupting noise estimates.
+
+### 2.4 Auction handling
+
+NYSE Arca opening (09:30) and closing (16:00) auctions for HYG produce a single print at a venue-determined price that does not represent continuous-market pricing. Treat the auction print as an event of type `auction` and **do not** include in the Kalman filter measurement equation; instead, reset the filter's pre-open state from the auction price and resume continuous updates from 09:30:00.000 onward.
+
+### 2.5 Futures roll handling
+
+ES1, ZN1, CL1 are rolling front-month contracts. The model uses a continuous front-contract series with a "Panama" splice on the official roll date (the first day open interest in the back month exceeds the front, evaluated end-of-day). The splice adjustment is applied to the entire historical series back-adjusted at refit time.
+
+For the daily rolling refit (Section 6), the splice is silent — parameters are estimated on the back-adjusted series. For online operation, the model switches contracts on the morning of the roll day at 09:30 ET; the basis $z_t$ is **reset to zero** at the splice instant to absorb the discrete price step, and the catch-up term is suppressed for the first 60 seconds post-splice.
+
+### 2.6 HYG dividend handling
+
+HYG pays monthly dividends with ex-dates typically the first business day of the month. On the ex-date:
+- The split-adjusted log-price has a discrete step equal to $-\log(1 - d/P)$ where $d$ is the per-share dividend and $P$ is the previous close.
+- The basis $z_t$ would otherwise show a large artificial deviation; instead, adjust the model's intercept $\alpha_t$ by the negative of the log-dividend ratio at 09:30 ET on the ex-date.
+
+### 2.7 Special dates
+
+Maintain a calendar table of:
+- Half-days (early close at 13:00 ET) — model trades only until 12:30 ET.
+- FOMC announcement days — log a flag, do not change behaviour, but tag for diagnostic separation in backtests.
+- Treasury auction settlement days — flag for diagnostic separation.
+- Quarter-end and year-end — flag (basis behaviour is structurally different; some firms exclude from training data).
+
+---
+
+## 3. Event Stream Construction
+
+### 3.1 Merged event stream
+
+For online operation and EM estimation, merge all cleaned per-symbol streams into a single time-ordered stream of events keyed by `ts_ns`. For ties in `ts_ns` across symbols, order by exchange precedence (CME → NYSE Arca → ICE → Cboe), which reflects the typical fastest-to-slowest data dissemination order.
+
+The event stream is the primary input to all downstream stages.
+
+### 3.2 Hayashi–Yoshida overlap convention
+
+For the offline EM step (Section 6), cross-products between asynchronous series are computed using the Hayashi–Yoshida overlap estimator. Given two series with returns $\Delta X_i$ over intervals $(\tau_{i-1}, \tau_i]$ and $\Delta Y_j$ over intervals $(\sigma_{j-1}, \sigma_j]$:
+
+$$\widehat{\langle X, Y \rangle}_{[0,T]} = \sum_{i,j} \Delta X_i \cdot \Delta Y_j \cdot \mathbb{1}\{(\tau_{i-1}, \tau_i] \cap (\sigma_{j-1}, \sigma_j] \neq \emptyset\}$$
+
+This estimator is unbiased and consistent for the integrated covariation under no-arbitrage assumptions on the efficient prices. **Do not** build a synchronous bar grid first — that introduces Epps-effect bias on the order of 30–50% at minute frequency for HYG–ES1 covariance.
+
+### 3.3 Bar grids (where used)
+
+Some downstream operations require bar-aligned data:
+- Conformal calibration window scoring (Section 8) — uses 5-second bars.
+- Diagnostic plots (Section 11.1) — uses 1-minute bars.
+- Daily refit summary statistics — uses 1-minute bars.
+
+When constructing bars, use the **last accepted log-mid** in the bar interval (closing-price convention); if no accepted quote occurred in the bar interval, carry forward the previous bar's value but flag the bar as "stale" and exclude from downstream estimation.
+
+---
+
+## 4. Microstructure Noise Estimation
+
+### 4.1 Two-Scales Realised Volatility for HYG
+
+Estimate the noise variance $\sigma_\nu^2$ in the HYG log-mid every trading day from the previous 5 trading days of tick data, using the Zhang–Mykland–Aït-Sahalia TSRV estimator.
+
+Define the realised volatility at sampling frequency $K$ over the day as:
+$$\widehat{\text{RV}}^{(K)} = \sum_{i=1}^{n/K} (S_{t_{iK}} - S_{t_{(i-1)K}})^2$$
+
+The TSRV estimator combines a sub-sampled "slow" estimate and an "all-data" estimate to bias-correct:
+$$\widehat{\text{TSRV}} = \widehat{\text{RV}}^{(\text{slow})} - \frac{\bar{n}_{\text{slow}}}{n_{\text{all}}} \widehat{\text{RV}}^{(1)}$$
+
+where the slow scale uses sub-sampled subgrids of length $K \approx n^{1/3}$.
+
+The **noise variance** is then identified from the all-data RV:
+$$\widehat{\sigma}_\nu^2 = \frac{1}{2n_{\text{all}}} \widehat{\text{RV}}^{(1)} - \frac{1}{2n_{\text{all}}} \widehat{\text{TSRV}}$$
+
+For HYG on a typical day the resulting $\widehat{\sigma}_\nu$ is on the order of 0.3–0.8 bps per tick.
+
+### 4.2 Noise variance for fast factors
+
+ES1, ZN1, CL1 are sufficiently liquid that microstructure noise is small relative to efficient-price variance at second frequency. Set $\sigma_\nu^2(\text{fast}) = 0$ in the measurement equation. This is an approximation; revisit if backtest diagnostics show structural over-fitting around fast-factor jumps.
+
+For MOVE and VIX, the index is a deterministic computation, not a tradable price, so $\sigma_\nu^2 = 0$ by construction; what matters is the staleness lag, handled in Section 9.
+
+### 4.3 Noise diagnostic
+
+Daily, plot:
+- Signature plot (RV vs. sampling frequency) — should asymptote to a positive limit as frequency increases, with the limit equalling $2n \sigma_\nu^2$.
+- Autocorrelation of 1-second HYG returns — should show negative AR(1) (bid-ask bounce) of order $-0.2$ to $-0.4$ on quiet days.
+- Variance ratio of $k$-period returns to $k \times$ (1-period variance) — should be below 1 for $k$ small (noise dominance) and approach 1 as $k$ grows.
+
+Any structural break in these diagnostics is a flag to halt trading and re-examine the cleaning pipeline.
+
+---
+
+## 5. Initial Parameter Estimation (Cold Start)
+
+This stage runs on fresh data with no prior model state. It produces the initial guess fed into the EM in Section 6.
+
+### 5.1 Static OLS for fast-factor projection
+
+On a 4-week training sample using 5-second bar mids:
+
+1. Compute $\Delta S_t, \Delta \mathbf{F}_t$ on the bar grid.
+2. OLS regression:
+$$\Delta S_t = \boldsymbol{\beta}_0^\top \Delta \mathbf{F}_t^H + \boldsymbol{\gamma}_0^\top \Delta \mathbf{F}_t^S + \sum_{k=1}^{K} \boldsymbol{\phi}_{k,0}^\top \Delta \mathbf{F}_{t-k} + u_t$$
+with $K = 6$ (i.e., 30 seconds of distributed lag).
+3. Compute Newey–West HAC standard errors with 12-lag Bartlett kernel.
+4. Retain $(\boldsymbol{\beta}_0, \boldsymbol{\gamma}_0, \boldsymbol{\phi}_{1:K,0})$ as initial estimates.
+
+Drop any factor whose coefficient is not statistically significant at the 5% level and whose absolute economic magnitude (coefficient × factor std-dev) is below 0.1× the std-dev of $\Delta S_t$. This prevents overfitting weakly-identified factors.
+
+### 5.2 Cumulative impulse response
+
+Compute the cumulative impulse response of HYG to a unit shock in each fast factor:
+$$\text{IRF}_j(h) = \beta_{0,j} + \sum_{k=1}^{h} \phi_{k,0,j}$$
+
+Plot for $h = 0, 5, 10, \ldots, 60$ seconds. The IRF should monotonically converge to a stable level by $h \approx 30$ seconds. If it overshoots and reverts, the lag structure is too short and $K$ should be increased. If it grows past 60s, the long-run beta is mis-identified and likely contaminated by autocorrelation in the basis — re-run with the basis component subtracted.
+
+### 5.3 Static intercept
+
+Compute the static $\alpha_0$ as the mean of the level residual:
+$$\alpha_0 = \overline{S_t - \boldsymbol{\beta}_0^\top \mathbf{F}_t^H - \boldsymbol{\gamma}_0^\top \mathbf{F}_t^S}$$
+
+### 5.4 Basis residual analysis
+
+Construct the in-sample basis:
+$$z_t^{\text{init}} = S_t - V_t^{\text{init}}, \quad V_t^{\text{init}} = \boldsymbol{\beta}_0^\top \mathbf{F}_t^H + \boldsymbol{\gamma}_0^\top \mathbf{F}_t^S + \alpha_0$$
+
+Run on $z_t^{\text{init}}$:
+1. **ADF test** — if non-stationary at 5%, this is consistent with the partial-cointegration assumption (random-walk component dominant). Proceed.
+2. **Phillips–Perron test** — sanity check.
+3. **KPSS test** with stationarity null — if rejected, even more confirmation of non-stationary component.
+4. **Variance ratio test** at lags 1, 5, 30 minutes — assess random-walk-ness directly.
+
+Document these for the audit log; they are not gating tests, but their results inform the prior on $\sigma_R^2$ in the EM.
+
+### 5.5 Partial cointegration initial fit
+
+Fit the Clegg–Krauss partial-cointegration model to $z_t^{\text{init}}$ (state-space model with random-walk + AR(1) components) by maximum likelihood. The CK package or an equivalent custom implementation produces:
+$$\widehat{\rho}_0, \widehat{\sigma}_M^{2,(0)}, \widehat{\sigma}_R^{2,(0)}$$
+
+Initial $\kappa_0 = 1 - \widehat{\rho}_0$.
+
+### 5.6 Pass-through coefficient
+
+Fit the partial-adjustment ECM directly:
+$$\Delta S_t = \delta_0 \Delta V_t^{\text{init}} - \kappa_0 z_{t-1}^{\text{init}} + e_t$$
+
+Treating $\delta_0$ as a free parameter, separate from the $\kappa_0$ from Section 5.5. Use Hansen's (1982) GMM with $\Delta \mathbf{F}_{t-1}$ and $z_{t-2}$ as instruments to deal with the simultaneity between $\Delta V_t$ and contemporaneous quote noise in $\Delta S_t$. Typical estimate $\widehat{\delta}_0 \in [0.6, 0.85]$ for HYG.
+
+### 5.7 Parameter sanity check
+
+Initial estimates must satisfy:
+- $\widehat{\delta}_0 \in (0, 1]$
+- $\widehat{\kappa}_0 \in (0, 0.5)$ on 5-second bars
+- $\widehat{\sigma}_M^2 + \widehat{\sigma}_R^2 \approx \text{Var}(\Delta z_t^{\text{init}})$ within 20%
+- All $\widehat{\boldsymbol{\beta}}$ entries within 3 std-dev of their literature priors (HYG-to-ES1 beta near 0.10–0.15)
+
+If any check fails, halt and investigate. The most common cause is a corrupted dividend adjustment or a missed futures roll.
+
+---
+
+## 6. Joint State-Space Estimation (EM)
+
+### 6.1 State-space form
+
+Stack the time-varying parameters into a state vector:
+$$\boldsymbol{\theta}_t = (\boldsymbol{\beta}_t^\top, \boldsymbol{\gamma}_t^\top, \boldsymbol{\phi}_{1,t}^\top, \ldots, \boldsymbol{\phi}_{K,t}^\top, \alpha_t, M_t, R_t)^\top$$
+
+State equation:
+$$\boldsymbol{\theta}_t = \mathbf{T}\, \boldsymbol{\theta}_{t-1} + \boldsymbol{\eta}_t, \qquad \boldsymbol{\eta}_t \sim \mathcal{N}(\mathbf{0}, \mathbf{Q})$$
+
+where $\mathbf{T}$ is identity except for the $M$-row, where $T_{MM} = \rho$, and $\mathbf{Q}$ is block-diagonal with blocks:
+- $\mathbf{Q}_\beta$ for $\boldsymbol{\beta}$, size $n_H \times n_H$
+- $\mathbf{Q}_\gamma$ for $\boldsymbol{\gamma}$, size $n_S \times n_S$
+- $\mathbf{Q}_\phi$ for the lag block
+- $q_\alpha$ scalar
+- $\sigma_M^2$ scalar
+- $\sigma_R^2$ scalar
+
+Measurement equation (only when an HYG event occurs):
+$$S_t = \boldsymbol{\beta}_t^\top \mathbf{F}_t^H + \boldsymbol{\gamma}_t^\top \mathbf{F}_t^S + \sum_{k=1}^{K} \boldsymbol{\phi}_{k,t}^\top \Delta\mathbf{F}_{t-k} + \alpha_t + M_t + R_t + \nu_t$$
+$$\nu_t \sim \mathcal{N}(0, \sigma_\nu^2)$$
+
+Note: the basis components $M_t$ and $R_t$ enter the measurement equation additively, since $z_t = S_t - V_t = M_t + R_t$ by definition.
+
+### 6.2 Kalman filter recursions
+
+Standard linear Gaussian Kalman filter, with $\mathbf{H}_t$ assembled from the current fast-factor values:
+$$\mathbf{H}_t = (\mathbf{F}_t^{H\top}, \mathbf{F}_t^{S\top}, \Delta\mathbf{F}_{t-1}^\top, \ldots, \Delta\mathbf{F}_{t-K}^\top, 1, 1, 1)$$
+
+Predict:
+$$\boldsymbol{\theta}_{t|t-1} = \mathbf{T}\,\boldsymbol{\theta}_{t-1|t-1}$$
+$$\mathbf{P}_{t|t-1} = \mathbf{T}\,\mathbf{P}_{t-1|t-1}\mathbf{T}^\top + \mathbf{Q}$$
+
+Update (only on HYG events):
+$$\hat{S}_{t|t-1} = \mathbf{H}_t^\top \boldsymbol{\theta}_{t|t-1}$$
+$$\nu_t = S_t - \hat{S}_{t|t-1}$$
+$$F_t = \mathbf{H}_t^\top \mathbf{P}_{t|t-1} \mathbf{H}_t + \sigma_\nu^2$$
+$$\mathbf{K}_t = \mathbf{P}_{t|t-1} \mathbf{H}_t / F_t$$
+$$\boldsymbol{\theta}_{t|t} = \boldsymbol{\theta}_{t|t-1} + \mathbf{K}_t \nu_t$$
+$$\mathbf{P}_{t|t} = \mathbf{P}_{t|t-1} - \mathbf{K}_t \mathbf{H}_t^\top \mathbf{P}_{t|t-1}$$
+
+On non-HYG events (a fast-factor tick), update $\mathbf{F}_t^H, \mathbf{F}_t^S$ but do not run the measurement update; only the state propagation step applies, and the basis is recomputed implicitly via the changed $V_t$.
+
+### 6.3 Backward smoother
+
+For EM, run the Rauch–Tung–Striebel smoother backward from $T$ to $0$:
+$$\mathbf{C}_t = \mathbf{P}_{t|t} \mathbf{T}^\top \mathbf{P}_{t+1|t}^{-1}$$
+$$\boldsymbol{\theta}_{t|T} = \boldsymbol{\theta}_{t|t} + \mathbf{C}_t (\boldsymbol{\theta}_{t+1|T} - \boldsymbol{\theta}_{t+1|t})$$
+$$\mathbf{P}_{t|T} = \mathbf{P}_{t|t} + \mathbf{C}_t (\mathbf{P}_{t+1|T} - \mathbf{P}_{t+1|t}) \mathbf{C}_t^\top$$
+
+### 6.4 EM updates
+
+The static parameters $(\rho, \sigma_M^2, \sigma_R^2, \sigma_\nu^2)$ and the discount factors implicit in $\mathbf{Q}_\beta, \mathbf{Q}_\gamma, \mathbf{Q}_\phi, q_\alpha$ are updated via M-step closed forms.
+
+For the AR(1) coefficient:
+$$\rho^{(\text{new})} = \frac{\sum_t \mathbb{E}[M_t M_{t-1} \mid \mathcal{D}_T]}{\sum_t \mathbb{E}[M_{t-1}^2 \mid \mathcal{D}_T]}$$
+
+For the innovation variances, use the smoothed expected sums of squares:
+$$\sigma_M^{2,(\text{new})} = \frac{1}{T} \sum_t \mathbb{E}[(M_t - \rho M_{t-1})^2 \mid \mathcal{D}_T]$$
+$$\sigma_R^{2,(\text{new})} = \frac{1}{T} \sum_t \mathbb{E}[(R_t - R_{t-1})^2 \mid \mathcal{D}_T]$$
+
+For the state-noise blocks (on the time-varying parameters), use the West–Harrison **discount-factor parameterisation**:
+$$\mathbf{Q}_\beta = \frac{1 - \delta_\beta}{\delta_\beta} \mathbf{P}_{\beta, t-1|t-1}$$
+
+with $\delta_\beta$ chosen by maximising the predictive likelihood on a held-out validation period. Grid-search $\delta_\beta \in \{0.995, 0.997, 0.999, 0.9995, 0.9999\}$. Equivalent procedure for $\delta_\gamma, \delta_\phi, \delta_\alpha$.
+
+For $\sigma_\nu^2$, prefer the TSRV estimate from Section 4 over the EM-implied estimate; the latter is biased by misspecification of the systematic component.
+
+### 6.5 Convergence
+
+Iterate E-step (filter + smoother) and M-step until:
+- Relative change in log-likelihood below $10^{-5}$, or
+- 50 EM iterations completed.
+
+Verify post-convergence:
+- Innovation series $\{\nu_t\}$ is approximately white (Ljung–Box at lag 30 not significant at 1%).
+- Standardised innovations $\nu_t / \sqrt{F_t}$ have variance close to 1 (within $[0.9, 1.1]$).
+- No EM step decreased the likelihood (a sign of bug or near-singularity).
+
+---
+
+## 7. Regime Identification (Hamilton EM)
+
+The state-space estimation in Section 6 is run **conditional on regime $N$**. The regime layer sits on top.
+
+### 7.1 Augmented model
+
+Let $\Theta_j = (\delta_j, \kappa_j, \sigma_j^2, \sigma_M^2(j))$ for $j \in \{N, S\}$ denote regime-specific parameters. The conditional likelihood of the next innovation given regime $j$ is:
+$$f(\nu_t \mid s_t = j, \mathcal{F}_{t-1}) = \frac{1}{\sqrt{2\pi(F_t + \sigma_j^2)}} \exp\left(-\frac{\nu_t^2}{2(F_t + \sigma_j^2)}\right)$$
+
+where the regime-conditional innovation uses the regime-conditional state propagation:
+$$\hat{S}_{t|t-1}^{(j)} = \boldsymbol{\beta}_{t|t-1}^\top \mathbf{F}_t^H + \delta_j \Delta V_t - \kappa_j z_{t-1} + \ldots$$
+
+### 7.2 Time-varying transition probabilities
+
+Following Filardo (1994), let the transition probabilities depend on observable stress conditioners $\mathbf{x}_t$:
+$$p_{NS}(\mathbf{x}_t) = \text{logit}^{-1}(\theta_0 + \boldsymbol{\theta}_1^\top \mathbf{x}_t)$$
+$$p_{SN}(\mathbf{x}_t) = \text{logit}^{-1}(\psi_0 + \boldsymbol{\psi}_1^\top \mathbf{x}_t)$$
+
+Conditioner vector $\mathbf{x}_t$:
+- $\Delta \log \text{MOVE}_t$ over the trailing 5 minutes
+- $\Delta \log \text{VIX}_t$ over the trailing 5 minutes
+- Indicator $\mathbb{1}\{\Delta \log \text{ES1}_t < -2\hat{\sigma}_{\text{ES1}}^{30d}\}$ for equity tail down-moves
+- $|z_t| / \hat{\sigma}_z^{30d}$ — current basis stress ratio
+- HYG–iNAV spread normalised by 30-day median absolute value
+- TRACE constituent print intensity (5-min rolling count, log-transformed)
+
+### 7.3 Hamilton forward filter
+
+Initial $\pi_0$ from the long-run distribution implied by $\mathbf{P}_0$.
+
+For $t = 1, \ldots, T$:
+
+Predict:
+$$\pi_{t|t-1}(j) = \sum_i p_{ij}(\mathbf{x}_t)\, \pi_{t-1|t-1}(i)$$
+
+Update on each HYG measurement event:
+$$\pi_{t|t}(j) = \frac{f(\nu_t^{(j)} \mid s_t = j, \mathcal{F}_{t-1})\, \pi_{t|t-1}(j)}{\sum_k f(\nu_t^{(k)} \mid s_t = k, \mathcal{F}_{t-1})\, \pi_{t|t-1}(k)}$$
+
+The likelihood contribution for the EM is $\log \sum_j f(\nu_t^{(j)} \mid s_t = j, \mathcal{F}_{t-1})\, \pi_{t|t-1}(j)$.
+
+### 7.4 Hamilton backward smoother (Kim 1994)
+
+For the EM, smooth backward:
+$$\pi_{t|T}(j) = \pi_{t|t}(j) \sum_k \frac{p_{jk}(\mathbf{x}_{t+1})\, \pi_{t+1|T}(k)}{\pi_{t+1|t}(k)}$$
+
+Pairwise smoothed probabilities (needed for transition logit re-estimation):
+$$\pi_{t,t+1|T}(i,j) = \pi_{t|t}(i) \cdot p_{ij}(\mathbf{x}_{t+1}) \cdot \frac{\pi_{t+1|T}(j)}{\pi_{t+1|t}(j)}$$
+
+### 7.5 EM updates
+
+For regime-specific parameters (M-step closed forms with smoothed weights):
+$$\widehat{\delta}_j^{(\text{new})} = \frac{\sum_t \pi_{t|T}(j) \Delta V_t \Delta S_t}{\sum_t \pi_{t|T}(j) (\Delta V_t)^2}$$
+
+(treating $\kappa$ component separately by orthogonalisation; in practice estimate via constrained nonlinear M-step, since $\delta$ and $\kappa$ both enter the same equation).
+
+For the transition logit, run weighted maximum likelihood on the smoothed pairwise probabilities, with $\pi_{t,t+1|T}(i,j)$ as the soft-assignment weight on observation $\mathbf{x}_{t+1}$ being a "transition from $i$ to $j$." This is a standard weighted logistic regression.
+
+### 7.6 Regime label identification
+
+By convention, the "Stress" regime is the one with the larger $\sigma_M^2(j)$. After EM, swap labels if necessary so that $\sigma_M^2(S) > \sigma_M^2(N)$. Document the final parameter set in the audit log.
+
+### 7.7 Convergence and sanity checks
+
+- Hamilton EM iterates to convergence in tandem with the Kalman EM; in practice run alternating M-steps for 30 outer iterations.
+- Final $p_{NN}$ should exceed 0.99 (regimes are persistent on 5-second bars).
+- Final $\sigma_M^2(S) / \sigma_M^2(N)$ should be in $[3, 15]$. Outside this range, the regime layer is either degenerate (collapsed to one regime) or pathological.
+- Average smoothed $\pi_{t|T}(S)$ over the training sample should fall in $[0.05, 0.25]$.
+
+---
+
+## 8. Conformal Calibration
+
+### 8.1 Calibration set
+
+From the smoother output (Section 7), select the calibration set as:
+$$\mathcal{C} = \{t : \pi_{t|T}(N) > 0.9\}$$
+
+Restricting to regime-clean observations ensures the conformal interval reflects the Normal-regime distribution, not the mixture.
+
+### 8.2 Z-score construction
+
+For each $t \in \mathcal{C}$:
+$$\tilde{M}_t = \frac{M_{t|T}}{\sqrt{\widehat{\sigma}_M^2(N) / (1 - \widehat{\rho}_N^2)}}$$
+
+The denominator is the unconditional std-dev of $M_t$ under the Normal-regime AR(1).
+
+### 8.3 Split conformal interval
+
+Split $\mathcal{C}$ chronologically into a proper training half and a calibration half. On the calibration half, compute non-conformity scores:
+$$R_t = |\tilde{M}_t|$$
+
+The two-sided conformal threshold at miscoverage level $\alpha$ is:
+$$U_\alpha = \text{Quantile}_{1-\alpha}\left(\{R_t : t \in \text{calibration half}\}\right)$$
+
+For trading purposes, choose $\alpha = 0.10$ (i.e., signal triggers on the top 10% of basis deviations under the Normal regime).
+
+### 8.4 Coverage validation
+
+On a held-out test window, compute the empirical miscoverage:
+$$\widehat{\alpha} = \frac{1}{|T_{\text{test}}|} \sum_{t \in T_{\text{test}}} \mathbb{1}\{|\tilde{M}_t| > U_\alpha\}$$
+
+If $|\widehat{\alpha} - \alpha| > 0.02$, the calibration is failing — likely from regime contamination. Refit with stricter $\pi(N)$ threshold (try 0.95).
+
+### 8.5 Alternative: weighted conformal (Tibshirani et al. 2019)
+
+When the regime distribution at trading-time differs from the calibration distribution, weighted conformal accounts for the covariate shift. Weight observation $t \in \mathcal{C}$ by $w_t = \pi_{t|T}(N) / \pi_t(N)|_{\text{trading time}}$. In practice this rarely changes $U_\alpha$ by more than a few percent and can be skipped in a v1 deployment.
+
+The static split conformal in 8.1–8.4 is the v1 baseline. Sections 8.6 and 8.7 specify two upgrades that the production system uses in tandem: an outer adaptive layer (Section 8.6) that retunes the target miscoverage online based on realized coverage, and an inner heteroscedastic layer (Section 8.7) that produces locally-adaptive intervals stratified by regime.
+
+### 8.6 Adaptive Conformal Inference and Conformal PID Control
+
+**Motivation.** Section 8.3's $U_\alpha$ is a constant computed at refit time. Even within the Normal regime, the distribution of $\tilde{M}_t$ drifts intraday — open and close are higher-vol than midday, FOMC weeks are higher-vol than calm weeks, and credit-specific stress can build slowly without flipping the Hamilton regime. A static threshold under-covers in build-up periods (firing trades on noise) and over-covers in calm periods (missing real signals). The fix is to adapt the threshold online based on observed coverage error, with provable long-run coverage guarantees.
+
+**Adaptive Conformal Inference (ACI), Gibbs & Candès 2021.** Maintain a time-varying miscoverage level $\alpha_t$ and update it after each observation:
+
+$$\alpha_{t+1} = \alpha_t + \gamma\,(\alpha^* - \text{err}_t)$$
+
+where:
+- $\alpha^*$ is the *target* miscoverage (e.g., 0.10).
+- $\text{err}_t = \mathbb{1}\{|\tilde{M}_t| > U_{\alpha_t}\}$ is the realized "interval-violation" indicator at $t$.
+- $\gamma > 0$ is the learning rate (typical: $\gamma = 0.005$ on 5-second event clock).
+- $U_{\alpha_t}$ is the conformal quantile *recomputed each step* at the current $\alpha_t$ from a sliding calibration window.
+
+The guarantee (Gibbs & Candès Theorem 1) is that for *any* sequence of observations, including under arbitrary distribution shift:
+$$\left|\frac{1}{T}\sum_{t=1}^T \text{err}_t - \alpha^*\right| \le \frac{\gamma + 1}{\gamma T} \to 0 \text{ as } T \to \infty$$
+
+This is a long-run coverage guarantee with no exchangeability assumption. The trade-off is that intervals can be wide during shifts (the system pays for adaptation with width).
+
+**Conformal PID Control, Angelopoulos, Candès & Tibshirani 2024.** ACI is a pure proportional controller; its convergence is slow when shifts are persistent and oscillatory when shifts reverse. Replace the ACI update with a PID controller that adds integral and derivative-style terms:
+
+$$q_{t+1} = \underbrace{q_t + \eta\,(\text{err}_t - \alpha^*)}_{\text{P (= ACI)}} + \underbrace{K_I \cdot \sigma\!\left(\sum_{\tau=1}^{t}(\text{err}_\tau - \alpha^*)\right)}_{\text{I (drift correction)}} + \underbrace{\widehat{s}_{t+1}}_{\text{D (scorecaster)}}$$
+
+where:
+- $q_t$ is the conformal quantile at step $t$ (replaces $U_{\alpha_t}$ in the ACI form).
+- $\sigma(\cdot)$ is a saturating nonlinearity (e.g., $\sigma(x) = K \tanh(x / K)$) that prevents the integral term from blowing up.
+- $\widehat{s}_{t+1}$ is a "scorecaster" — a separate predictor of the next conformity score from the current state. In the HYG setting, train a small ridge regression of $|\tilde{M}_{t+1}|$ on $(\pi_t(N), \text{MOVE}_t, \text{intraday clock}, \text{rolling 5-min RV of HYG})$ on the trailing month of data; refit weekly.
+
+The PID controller delivers tighter intervals than ACI under persistent shifts (lower regret) while retaining the long-run coverage property.
+
+**Implementation in the HYG model.** After Section 8.4 cold calibration:
+
+1. Initialise $\alpha_0 = \alpha^* = 0.10$, $q_0 = U_{\alpha^*}$ from Section 8.3.
+2. Maintain a rolling 4-hour window of $\{\tilde{M}_\tau\}$ for the calibration set.
+3. After every HYG measurement event:
+   - Compute $\text{err}_t$ from the current $\tilde{M}_t$ and $q_t$.
+   - Update $q_{t+1}$ via the PID rule.
+   - Refresh the calibration quantile to keep $q_{t+1}$ consistent with the empirical distribution at level $\alpha_{t+1}$ (using $q_{t+1}$ from the controller as the target, and the empirical quantile as a safety floor).
+
+**Calibration of $\eta, K_I$, scorecaster regularisation.** Tune on a 6-month walk-forward to minimise *quantile loss* of $q_t$ against realised $|\tilde{M}_t|$, subject to the long-run coverage constraint. Sensible starting values: $\eta = 0.01$, $K_I = 0.005$, $K = 5$ (saturation level).
+
+**Diagnostic.** Plot the running miscoverage $\bar{\text{err}}_t$ over the trailing 1-day window; it should stay within $[\alpha^* - 0.02, \alpha^* + 0.02]$. Sustained drift outside this band indicates the scorecaster is missing a structural feature.
+
+### 8.7 Conformalized Quantile Regression with Mondrian regime stratification
+
+**Motivation.** Section 8.6 adapts a *single* threshold over time. But on any given tick, the right threshold depends on the local state — the Kalman filter's predicted variance is not constant, MOVE level shifts the credit-vol regime continuously, and time-of-day liquidity reshapes the basis distribution. A locally adaptive interval is structurally different from an adaptive global threshold. Conformalized Quantile Regression (CQR; Romano, Patterson & Candès 2019) provides locally-adaptive intervals with finite-sample marginal coverage. Mondrian stratification (Vovk, Lindsay, Nouretdinov & Gammerman) ensures the coverage holds *conditionally on the regime label*, not just marginally — important when regime probabilities are extreme.
+
+**Step 1: Train conditional quantile regressors.** Define the feature vector at time $t$:
+$$\mathbf{X}_t = \big(\,\widehat{\sigma}_{V,t},\; \log\text{MOVE}_t,\; \log\text{VIX}_t,\; \tau_t,\; \text{RV}_{HYG,t}^{5m},\; \text{spread}_{HYG,t},\; |z_{t-1}|\,\big)^\top$$
+
+where $\widehat{\sigma}_{V,t}$ is the Kalman filter's one-step-ahead std-dev of $V_t$, $\tau_t \in [0,1]$ is fractional time-of-day (intraday seasonality proxy), $\text{RV}_{HYG,t}^{5m}$ is the trailing 5-minute realised volatility of HYG.
+
+Fit two quantile regression models on the training half of the calibration set:
+$$\widehat{q}_{\alpha^*/2}(\mathbf{X}) \approx \text{Quantile}_{\alpha^*/2}(\tilde{M} \mid \mathbf{X})$$
+$$\widehat{q}_{1-\alpha^*/2}(\mathbf{X}) \approx \text{Quantile}_{1-\alpha^*/2}(\tilde{M} \mid \mathbf{X})$$
+
+Estimator choice:
+- **v1**: linear quantile regression (Koenker–Bassett 1978) — interpretable, no overfitting risk, fits in milliseconds.
+- **v2**: gradient-boosted quantile regression (LightGBM with quantile loss) — captures nonlinearities, especially the interaction between MOVE level and time-of-day.
+- **v3**: small feed-forward neural network with pinball loss — only if v2 leaves systematic structure in residuals.
+
+Given your existing GARCH-conformity work (the COPA 2026 line), the v2 estimator with explicit volatility features is the natural fit and removes the need for separate heteroscedastic scaling.
+
+**Step 2: Compute conformity scores on the calibration half.** Following Romano et al.:
+$$E_t = \max\big(\widehat{q}_{\alpha^*/2}(\mathbf{X}_t) - \tilde{M}_t,\; \tilde{M}_t - \widehat{q}_{1-\alpha^*/2}(\mathbf{X}_t)\big)$$
+
+This is the smallest signed correction needed to make the predicted interval cover the realisation. Negative $E_t$ means the predicted interval already covers; positive means it failed.
+
+**Step 3: Mondrian stratification.** Stratify the calibration set by regime label:
+- $\mathcal{C}_N = \{t \in \text{calib half} : \pi_{t|T}(N) > 0.9\}$
+- $\mathcal{C}_S = \{t \in \text{calib half} : \pi_{t|T}(S) > 0.9\}$
+
+Within each stratum, compute the conformal correction:
+$$Q_\alpha^{(N)} = \text{Quantile}_{1-\alpha^*}\big(\{E_t : t \in \mathcal{C}_N\}\big), \qquad Q_\alpha^{(S)} = \text{Quantile}_{1-\alpha^*}\big(\{E_t : t \in \mathcal{C}_S\}\big)$$
+
+Boundary observations with $\pi(N) \in [0.1, 0.9]$ are dropped from both strata to keep them clean. (Alternatively, train a third "mixed" regime stratum, but in practice the regime-clean approach is more robust.)
+
+**Step 4: Online interval at the test point.** At trading-time $t$, observe $\mathbf{X}_t$ and the current regime probabilities. The CQR-Mondrian interval is a regime-mixture:
+$$L_t = \pi_t(N)\big[\widehat{q}_{\alpha^*/2}(\mathbf{X}_t) - Q_\alpha^{(N)}\big] + \pi_t(S)\big[\widehat{q}_{\alpha^*/2}(\mathbf{X}_t) - Q_\alpha^{(S)}\big]$$
+$$U_t = \pi_t(N)\big[\widehat{q}_{1-\alpha^*/2}(\mathbf{X}_t) + Q_\alpha^{(N)}\big] + \pi_t(S)\big[\widehat{q}_{1-\alpha^*/2}(\mathbf{X}_t) + Q_\alpha^{(S)}\big]$$
+
+The trade trigger is $\tilde{M}_t \notin [L_t, U_t]$, which is now both locally adaptive (via $\mathbf{X}_t$) and regime-conditional (via the Mondrian quantile correction).
+
+**Coverage validation.** On a held-out test window, compute *conditional* coverage:
+$$\widehat{\alpha}_N = \frac{|\{t : \pi_t(N) > 0.9, \tilde{M}_t \notin [L_t, U_t]\}|}{|\{t : \pi_t(N) > 0.9\}|}$$
+
+and similarly $\widehat{\alpha}_S$. Both should be within 0.02 of $\alpha^*$. If $\widehat{\alpha}_S$ is far above target, your stress-regime calibration set is too small or too contaminated; if far below, your quantile regressors are over-estimating stress-regime spread (likely overfitting).
+
+**Why CQR over locally-weighted conformal.** Both produce locally-adaptive intervals. CQR has two advantages here: (i) it adapts asymmetrically (the upper and lower quantile regressors are independent), which matches HYG basis behaviour where stress-driven discounts are larger than premiums; (ii) the conformity score is interpretable as "by how much did the predicted quantile miss," which gives a natural diagnostic that locally-weighted conformal does not.
+
+### 8.8 Composition and integration with the trading rule
+
+The two methods compose: CQR-Mondrian provides *the calibrated interval*, and PID-ACI provides *the target miscoverage level that it is calibrated to*.
+
+**Composition recipe:**
+
+1. The PID-ACI controller (8.6) maintains a slowly-evolving target $\alpha_t^*$ around the design target (e.g., 0.10). When realised coverage drifts, $\alpha_t^*$ adjusts to restore it.
+2. The CQR-Mondrian intervals (8.7) are recomputed at the *current* $\alpha_t^*$. The quantile regressors $\widehat{q}_{\alpha^*/2}, \widehat{q}_{1-\alpha^*/2}$ are not retrained intraday — they are trained on a grid of nominal $\alpha^*$ values (e.g., $\{0.05, 0.075, 0.10, 0.125, 0.15\}$) at refit time, and the controller's $\alpha_t^*$ is mapped to the nearest grid point at each tick. The Mondrian quantile corrections $Q_\alpha^{(N)}, Q_\alpha^{(S)}$ are likewise stored on the grid.
+3. The trade trigger uses the composed interval $[L_t(\alpha_t^*), U_t(\alpha_t^*)]$.
+
+**Updates to Section 10 trading rule.** Replace the static $U_\alpha$ trigger and $|\tilde{M}_t| - U_\alpha$ sizing with their composed analogues:
+
+Entry condition becomes:
+$$\tilde{M}_t \notin [L_t(\alpha_t^*),\, U_t(\alpha_t^*)] \quad \text{AND} \quad \pi_t(N) > 0.7 \quad \text{AND} \quad \text{spread filter}$$
+
+Sizing becomes:
+$$w_t = -\text{sign}(\tilde{M}_t - \mu_t) \cdot \pi_t(N) \cdot \min\!\Big(c \cdot d_t,\; w_{\max}\Big)$$
+
+where $\mu_t = (L_t + U_t)/2$ is the interval centre and:
+$$d_t = \begin{cases} (\tilde{M}_t - U_t)/(U_t - \mu_t) & \text{if } \tilde{M}_t > U_t \\ (L_t - \tilde{M}_t)/(\mu_t - L_t) & \text{if } \tilde{M}_t < L_t \\ 0 & \text{else} \end{cases}$$
+
+That is, distance is measured in *interval-half-widths* — a unit-free quantity comparable across regimes and intraday conditions, which is exactly what the original conformal z-score was trying to be.
+
+**Position-sizing modulation by interval width.** A key practical use of the locally-adaptive interval: when $U_t - L_t$ is large (high local uncertainty), the model is signalling that even a "trigger" is statistically marginal. Add a width-aware down-scaling:
+
+$$w_t \leftarrow w_t \cdot \min\!\left(1, \frac{\bar{w}}{U_t - L_t}\right)$$
+
+where $\bar{w}$ is the median interval width over the trailing trading day. This automatically de-leverages during MOVE spikes, late-day liquidity vacuums, and any other state the quantile regressors flag as high-spread. It is a strict improvement on a flat $w_{\max}$ cap.
+
+**Diagnostic dashboard additions.** Beyond Section 12.2:
+- Running $\bar{\text{err}}_t$ over trailing 1d (PID-ACI calibration health).
+- Current $\alpha_t^*$ vs. design target (PID-ACI drift indicator).
+- $\widehat{\alpha}_N, \widehat{\alpha}_S$ over trailing 1d (Mondrian conditional coverage).
+- Interval width $U_t - L_t$ time series; flag when sustained above 1.5× the trailing 5-day median (model-uncertainty alarm).
+- Decomposition of width into Normal-regime and Stress-regime contributions (to attribute width changes to regime probability shifts vs. genuine local-uncertainty changes).
+
+**Failsafe.** If PID-ACI fails to keep coverage in $[\alpha^* - 0.05, \alpha^* + 0.05]$ over 4 hours, the controller enters degraded mode: revert to the static $U_\alpha$ from Section 8.3 and flag for refit. This is the same kill-switch philosophy as elsewhere — a sub-system that is failing its own diagnostics should not drive trading decisions.
+
+---
+
+## 9. Online Inference Pipeline
+
+### 9.1 Architecture
+
+A single-threaded event loop consumes the merged event stream and maintains the model state. State variables:
+- Kalman state $\boldsymbol{\theta}_t, \mathbf{P}_t$
+- Regime probabilities $\boldsymbol{\pi}_t$
+- Basis decomposition $M_t, R_t$ (also implicit in $\boldsymbol{\theta}_t$)
+- Position $w_t$
+- Last-trade timestamps and prices for reconciliation
+
+### 9.2 Per-event handlers
+
+**Fast-factor quote event ($\mathbf{F}^H$ or $\mathbf{F}^S$ update):**
+1. Update the relevant entry of $\mathbf{F}_t^H$ or $\mathbf{F}_t^S$.
+2. Run Kalman *predict* step on $\boldsymbol{\theta}_t$ (no measurement update).
+3. Recompute $V_t$ and $z_t$.
+4. Update stress conditioners $\mathbf{x}_t$.
+5. Update $\boldsymbol{\pi}_t$ via Hamilton predict step (no measurement update).
+6. Re-evaluate trading rule (Section 10).
+
+**HYG quote event:**
+1. Update $S_t$ from the new mid.
+2. Run Kalman *predict and update* steps (state and measurement).
+3. Compute innovation $\nu_t$ and regime-conditional likelihoods.
+4. Update $\boldsymbol{\pi}_t$ via Hamilton update step.
+5. Re-evaluate trading rule.
+
+**MOVE / VIX index update:**
+1. Update relevant entry of $\mathbf{F}_t^S$.
+2. Lighter handling: predict step only on the Kalman state.
+3. Update conditioners $\mathbf{x}_t$ and Hamilton predict step.
+
+**iNAV update (every 15 sec during regular hours):**
+1. Use as a diagnostic, not a measurement input.
+2. Update the iNAV-spread component of $\mathbf{x}_t$.
+
+### 9.3 Latency budget
+
+Total tick-to-decision latency target: 200 microseconds (excluding network and OMS).
+- Event parse: < 5 µs
+- Kalman predict + update: < 50 µs
+- Hamilton update: < 30 µs
+- Trading rule evaluation: < 20 µs
+- Order construction: < 50 µs
+
+These are achievable on a modern CPU with state vector of dimension $\approx 20$, the relevant size for HYG with $K = 6$ lags.
+
+### 9.4 Numerical robustness
+
+- Kalman covariance matrix $\mathbf{P}_t$ kept in **square-root form** (Bierman / Joseph factorisation) to guarantee positive definiteness.
+- All log-likelihoods computed in log-space; never exponentiate raw differences.
+- Regime probabilities re-normalised each update; clip to $[10^{-6}, 1 - 10^{-6}]$ to prevent absorbing states.
+- All matrix inversions guarded by condition-number checks; if condition number exceeds $10^{10}$, fall back to pseudo-inverse and log a warning.
+
+---
+
+## 10. Trading Rule
+
+### 10.1 Signal triggers
+
+Entry condition (per event):
+$$|\tilde{M}_t| > U_\alpha \quad \text{AND} \quad \pi_t(N) > 0.7 \quad \text{AND} \quad \text{current spread on HYG} \leq \text{spread}_{\max}$$
+
+The spread filter prevents trying to trade during liquidity vacuums where the model thinks the basis is wide but execution would consume any expected edge.
+
+Exit conditions (any of):
+- $|\tilde{M}_t| < U_\alpha / 2$ — basis has materially closed
+- $\pi_t(S) > 0.5$ — regime flip detected
+- Position age exceeds 30 minutes — staleness cutoff
+- Realised P&L on position exceeds $+ 2 \times$ expected edge — take profit
+- Realised P&L on position exceeds $- 1 \times$ expected edge — stop loss
+- 12:30 ET on early-close days, 15:50 ET on regular days — flatten before close
+
+### 10.2 Sizing
+
+Target position size in HYG units:
+$$w_t = -\text{sign}(\tilde{M}_t) \cdot \pi_t(N) \cdot \min\left(c \cdot (|\tilde{M}_t| - U_\alpha), w_{\max}\right)$$
+
+with $c$ a sizing constant calibrated to a target dollar risk per trade (e.g., $c$ chosen so that $|\tilde{M}_t| - U_\alpha = 1$ produces a position with 1-minute Value-at-Risk of $\$25k$). Cap $w_{\max}$ enforces a maximum position size (e.g., $\$5M$ notional).
+
+### 10.3 Hedge construction
+
+Hedge fast-factor exposure at the **pass-through-adjusted** loadings:
+$$\mathbf{h}_t = -\delta_t \cdot \boldsymbol{\beta}_t \cdot w_t$$
+
+In dollar terms, this gives fast-factor notional hedges of $w_t \cdot \delta_t \cdot \beta_{t,j} \cdot P_{HYG,t} / P_{F_j,t}$ for each hedgeable factor $j$.
+
+Crucially, this hedges only the portion of HYG's expected price response that actually flows through to HYG quotes within the trade horizon. Hedging at full $\boldsymbol{\beta}_t$ over-hedges and converts a basis trade into an unintended directional bet on fast-factor mean reversion.
+
+### 10.4 Execution
+
+- HYG executed via passive limit orders at the inside, with a 200 ms fallback to marketable IOC if not filled.
+- ES1, ZN1 hedges executed via aggressive IOC at the inside, with split-order logic for sizes exceeding 50% of top-of-book.
+- All orders tagged with model version, signal value at decision time, and target position; tags persist to TCA.
+
+---
+
+## 11. Testing and Validation
+
+### 11.1 In-sample diagnostics
+
+Every refit produces a one-page diagnostic report including:
+- Standardised innovations time series and ACF
+- Smoothed regime probabilities over the training sample
+- Realised vs. predicted basis trajectory on a held-out day
+- Coverage table for conformal interval at $\alpha = 0.05, 0.10, 0.20$
+- Parameter values and their changes from the previous refit (alarm if any parameter changes by more than 30% day-over-day)
+
+### 11.2 Out-of-sample walk-forward backtest
+
+Standard walk-forward: train on weeks $[t-4, t]$, evaluate on week $t+1$, slide. Required reporting:
+- Net P&L per trade
+- Sharpe ratio (annualised, assuming 252 trading days)
+- Maximum drawdown
+- Hit rate (fraction of profitable round-trips)
+- Average holding period
+- Trade count per day
+- P&L attribution: basis-closure component, fast-factor drift component, residual
+
+The backtest must include a realistic transaction cost model. For HYG: assume execution at mid for limit orders that fill, half-spread + 0.5 bps slippage for marketable orders; futures: assume tick-and-a-half slippage on marketable orders. Optimistic execution assumptions are the most common cause of false-positive backtests.
+
+### 11.3 Statistical significance
+
+Compute:
+- Sharpe ratio standard error via Lo (2002) corrected formula accounting for return autocorrelation.
+- Probabilistic Sharpe ratio and Deflated Sharpe ratio (Bailey & López de Prado 2014) — particularly important here because the parameter space is large and overfitting risk is real.
+- Strategy-vs-benchmark t-statistic with HAC standard errors.
+
+A live deployment recommendation requires DSR > 0.95.
+
+### 11.4 Stress-period evaluation
+
+Specifically backtest performance through:
+- March 2020 (COVID dislocation)
+- October 2008 (peak crisis — synthetic since HYG was newer)
+- August 2011 (US downgrade)
+- December 2018 (Q4 risk-off)
+- March 2023 (regional banking stress)
+
+Required: model should *not lose money* during these periods, even if it makes none. A model that trades through stress is more dangerous than one that sits out — track regime-recognition lag (time from objective regime change to $\pi(S) > 0.5$); target lag below 60 seconds.
+
+### 11.5 Adversarial backtests
+
+- Permute the basis residual and check that the model produces near-zero P&L (sanity check on overfitting).
+- Replace one fast factor with a synthetic Brownian motion of matched volatility and verify the model assigns near-zero loading after EM (specification check).
+- Simulate iNAV staleness shocks (jump iNAV by $\pm 0.5\%$) and verify the model does not generate spurious signals (robustness check).
+
+### 11.6 Live shadow run
+
+Before any capital allocation, run the model in shadow mode for 30 trading days, recording all signals and *paper* P&L. Compare to backtest expectations. Live shadow Sharpe should be within 1 std-dev of backtest Sharpe; large divergences indicate model–reality mismatch in microstructure or execution assumptions.
+
+---
+
+## 12. Production Considerations
+
+### 12.1 Refit cadence
+
+- **Daily** (overnight, 18:00 ET): full EM refit on the trailing 4-week tick history. Compares new parameters against current production parameters; flags any change exceeding 3 std-dev of the parameter's bootstrap distribution.
+- **Weekly** (Sunday): regime-parameter refit including the transition logit re-estimation.
+- **Monthly**: review the factor set — has any factor become weakly identified? Is there a candidate to add?
+- **Ad hoc**: trigger an out-of-cycle refit if any of the daily diagnostics fails (innovation ACF, conformal coverage, parameter stability).
+
+### 12.2 Monitoring
+
+Real-time dashboards must show:
+- Current $z_t, M_t, R_t$
+- Current $\pi_t(N), \pi_t(S)$
+- Current $\boldsymbol{\beta}_t, \alpha_t$ vs. their EM-refitted values (drift indicators)
+- Realised vs. theoretical P&L over the trading day
+- Innovation z-score and rolling Ljung–Box p-value
+- Time since last HYG tick, last fast-factor tick (data feed health)
+
+Alarms fire on:
+- Standardised innovation $|\nu_t / \sqrt{F_t}| > 5$ (model surprise)
+- Innovation ACF $|\rho_1| > 0.3$ (specification break)
+- Regime probability flipping more than 4 times per minute (regime instability)
+- Position breaching size limits
+- Conformal coverage drifting outside $[\alpha - 0.05, \alpha + 0.05]$ over the trailing 4 hours
+
+### 12.3 Failsafes
+
+- **Kill switch on innovation ACF anomaly.** If rolling 30-minute Ljung–Box rejects whiteness at 0.1%, halt new entries (allow exits).
+- **Kill switch on data feed staleness.** If any required feed is silent for more than 30 seconds during regular hours, halt new entries.
+- **Position limit pre-check.** Every order re-checked against firm-wide HYG inventory limits, factor exposure limits, and overnight risk limits before submission.
+- **Periodic full state checkpoint.** Every 60 seconds, persist $(\boldsymbol{\theta}_t, \mathbf{P}_t, \boldsymbol{\pi}_t, w_t)$ to disk for warm-restart capability.
+
+### 12.4 Audit trail
+
+Every signal-driven order carries:
+- Model version (git SHA of estimation code, hash of parameter set)
+- Triggering values: $\tilde{M}_t, \pi_t(N), \pi_t(S), z_t, \mathbf{F}_t$
+- Timestamp at decision and at order submission
+- Computed expected edge and risk
+
+The audit trail is the primary input to TCA, model attribution, and post-mortem reviews.
+
+---
+
+## 13. Open Items and Future Extensions
+
+- **Replace MOVE with a swaption-implied-vol surface input.** MOVE is itself a constructed index; using the underlying 1m × 10y ATM straddle implied vol would be cleaner, at the cost of needing OTC data.
+- **Replace the partial CI residual model with a non-Gaussian spec.** The residual $\xi_t^M$ has fat tails; a Student-t or NIG innovation distribution with EM extension would tighten the conformal interval in normal regime.
+- **Add a co-jump filter.** Joint jumps in ES1 and ZN1 are observed and their HYG-pass-through is structurally different from continuous co-movement. Aït-Sahalia–Jacod jump tests applied at sub-second frequency would let us condition $\delta$ on jump-vs-continuous regime as a third dimension to the regime layer.
+- **Cross-ETF expansion.** HYG, JNK, SHYG, USHY for HY; LQD, IGSB, IGLB for IG. Multi-asset measurement vector allows joint estimation of credit-curve fast-factor loadings.
+- **Bond-side Layer.** Use TRACE prints on constituent bonds as a delayed but unbiased signal of "true" basket value. Forms a third measurement layer below NAV, potentially feeding into $R_t$ as an exogenous estimate of the non-tradable drift.
+
+---
+
+**Document control.** This specification is the source-of-truth contract for the model. All implementation must reference a numbered section. Changes require version bump and review by Credit Quant + Risk + Compliance.
